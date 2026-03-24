@@ -1,0 +1,5 @@
+{
+  "name": "HydroSource",
+  "description": "Plataforma modular para el monitoreo hídrico con mapas interactivos, gestión de puntos geográficos, carga de archivos KML y generación de informes PDF.",
+  "requestFramePermissions": ["geolocation"]
+}
