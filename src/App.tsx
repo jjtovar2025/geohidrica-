@@ -5,15 +5,24 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { MapContainer, TileLayer, FeatureGroup, GeoJSON } from 'react-leaflet';
+import { MapContainer, TileLayer, FeatureGroup, GeoJSON, LayersControl, Popup } from 'react-leaflet';
 import { EditControl } from "react-leaflet-draw";
+import L from 'leaflet';
 import { kml } from '@tmcw/togeojson';
 import jsPDF from 'jspdf';
-import 'jspdf-autotable';
-import { Map as MapIcon, FileUp, Download, Trash2, LogOut } from 'lucide-react';
+import autoTable from 'jspdf-autotable';
+import { Map as MapIcon, FileUp, Download, Trash2, LogOut, Layers, Info, Database, Save, X } from 'lucide-react';
 
 import 'leaflet/dist/leaflet.css';
 import 'leaflet-draw/dist/leaflet.draw.css';
+
+// Parche para eliminar el Warning de "_flat" en Leaflet 1.9+
+// Esto evita que la consola se llene de mensajes de advertencia innecesarios
+if (typeof window !== 'undefined') {
+  (L.Polyline.prototype as any)._flat = function (this: any) {
+    return L.LineUtil.isFlat(this._latlngs);
+  };
+}
 
 // Configuración Supabase
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -27,26 +36,41 @@ export default function App() {
   const [session, setSession] = useState<any>(null);
   const [puntos, setPuntos] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [selectedPunto, setSelectedPunto] = useState<any>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editForm, setEditForm] = useState<any>({});
+  const [tempLayer, setTempLayer] = useState<any>(null);
   const mapRef = useRef<any>();
 
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase) {
+      setSession({ user: { id: 'demo-user' } });
+      return;
+    }
 
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session) fetchPuntos();
+      if (session) {
+        setSession(session);
+        fetchPuntos();
+      } else {
+        setSession({ user: { id: 'demo-user' }, isDemo: true });
+      }
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
-      if (session) fetchPuntos();
+      if (session) {
+        setSession(session);
+        fetchPuntos();
+      } else {
+        setSession({ user: { id: 'demo-user' }, isDemo: true });
+      }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
   async function fetchPuntos() {
-    if (!supabase) return;
+    if (!supabase || session?.isDemo) return;
     setLoading(true);
     try {
       const { data, error } = await supabase.from('puntos_hidricos').select('*');
@@ -59,142 +83,344 @@ export default function App() {
     }
   }
 
-  // Manejador de subida de archivos KML
   const handleKMLUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !session || !supabase) return;
+    if (!file || !session) return;
 
     const reader = new FileReader();
     reader.onload = async (event) => {
-      if (!event.target?.result || !supabase) return;
-      const xml = new DOMParser().parseFromString(event.target.result as string, "text/xml");
-      const geojson = kml(xml);
-      
-      for (const feature of geojson.features) {
-        await supabase.from('puntos_hidricos').insert([{
-          user_id: session.user.id,
-          nombre: (feature.properties as any)?.name || "Punto KML",
-          tipo_geometria: feature.geometry.type,
-          geojson: feature,
-        }]);
+      try {
+        if (!event.target?.result) return;
+        const text = event.target.result as string;
+        const xml = new DOMParser().parseFromString(text, "text/xml");
+        
+        if (xml.getElementsByTagName("parsererror").length > 0) {
+          throw new Error("Error al leer el archivo XML/KML. Asegúrate de que es un archivo KML válido.");
+        }
+
+        const geojson = kml(xml);
+        if (!geojson || !geojson.features || geojson.features.length === 0) {
+          throw new Error("El archivo KML no contiene geometrías válidas.");
+        }
+        
+        const newPoints = [];
+        for (const feature of geojson.features) {
+          const point = {
+            id: crypto.randomUUID(),
+            user_id: session.user.id,
+            nombre: (feature.properties as any)?.name || "Punto KML",
+            sector: "Importado",
+            quebrada: "N/A",
+            rio: "N/A",
+            tipo_geometria: feature.geometry.type,
+            geojson: feature,
+            created_at: new Date().toISOString()
+          };
+          
+          if (supabase && !session.isDemo) {
+            await supabase.from('puntos_hidricos').insert([point]);
+          }
+          newPoints.push(point);
+        }
+        
+        if (session.isDemo) {
+          setPuntos(prev => [...prev, ...newPoints]);
+        } else {
+          fetchPuntos();
+        }
+        alert(`¡Éxito! Se importaron ${newPoints.length} elementos.`);
+      } catch (err: any) {
+        alert("Error con el KML: " + err.message);
       }
-      fetchPuntos();
     };
     reader.readAsText(file);
   };
 
-  // Generar Informe PDF
   const generarInforme = () => {
     const doc = new jsPDF() as any;
+    doc.setFontSize(16);
     doc.text("Informe de Monitoreo Hídrico - HydroSource", 20, 20);
     
     const tableData = puntos.map(p => [
       p.nombre, 
+      p.sector || 'N/A',
+      p.quebrada || 'N/A',
+      p.rio || 'N/A',
       p.tipo_geometria, 
-      p.notas || 'Sin notas', 
       new Date(p.created_at).toLocaleDateString()
     ]);
     
-    doc.autoTable({
-      head: [['Nombre', 'Tipo', 'Notas', 'Fecha']],
+    autoTable(doc, {
+      head: [['Nombre', 'Sector', 'Quebrada', 'Río', 'Tipo', 'Fecha']],
       body: tableData,
-      startY: 30
+      startY: 30,
+      styles: { fontSize: 8 }
     });
     
     doc.save("informe-hidrico.pdf");
   };
 
-  const handleAnonymousLogin = async () => {
-    if (!supabase) return;
+  const handleEdit = (punto: any) => {
+    setSelectedPunto(punto);
+    setEditForm(punto);
+    setIsEditing(true);
+  };
+
+  const saveEdit = async () => {
+    if (!supabase || !selectedPunto) return;
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signInAnonymously();
-      if (error) {
-        if (error.message.includes("disabled")) {
-          throw new Error("El acceso de invitado está desactivado. Activa 'Anonymous' en Authentication -> Providers en tu panel de Supabase.");
+      const isNew = !puntos.find(p => p.id === selectedPunto.id);
+      
+      if (!session.isDemo) {
+        if (isNew) {
+          const { error } = await supabase.from('puntos_hidricos').insert([editForm]);
+          if (error) throw error;
+        } else {
+          const { error } = await supabase
+            .from('puntos_hidricos')
+            .update({
+              nombre: editForm.nombre,
+              sector: editForm.sector,
+              quebrada: editForm.quebrada,
+              rio: editForm.rio,
+              notas: editForm.notas
+            })
+            .eq('id', selectedPunto.id);
+          if (error) throw error;
         }
-        throw error;
+        fetchPuntos();
+      } else {
+        if (isNew) {
+          setPuntos(prev => [...prev, editForm]);
+        } else {
+          setPuntos(prev => prev.map(p => p.id === selectedPunto.id ? { ...p, ...editForm } : p));
+        }
       }
-      setSession(data.session);
-    } catch (error: any) {
-      alert("⚠️ Configuración requerida: " + error.message);
+
+      if (tempLayer) {
+        tempLayer.remove();
+        setTempLayer(null);
+      }
+
+      setSelectedPunto({ ...selectedPunto, ...editForm });
+      setIsEditing(false);
+      alert("¡Registro guardado con éxito!");
+    } catch (error) {
+      console.error('Error saving point:', error);
+      alert("Error al guardar el registro");
     } finally {
       setLoading(false);
     }
   };
 
-  if (!supabaseUrl || !supabaseAnonKey) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-gray-100 p-4">
-        <div className="bg-white p-8 rounded-xl shadow-lg max-w-md text-center">
-          <h2 className="text-2xl font-bold text-red-600 mb-4">Configuración Requerida</h2>
-          <p className="text-gray-600 mb-6">
-            Por favor, configura las variables de entorno <strong>VITE_SUPABASE_URL</strong> y <strong>VITE_SUPABASE_ANON_KEY</strong> en el panel de Secretos.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!session) return <Login setSession={setSession} handleAnonymousLogin={handleAnonymousLogin} />;
-
   return (
     <div className="flex h-screen bg-gray-100 font-sans overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-80 bg-white shadow-xl flex flex-col p-4 z-[1000] relative">
-        <div className="flex items-center gap-2 mb-8 border-b pb-4">
-          <MapIcon className="text-blue-600" />
-          <h1 className="text-xl font-bold text-gray-800">HydroSource</h1>
+      <aside className="w-80 bg-white shadow-xl flex flex-col z-[1000] relative border-r">
+        <div className="p-4 border-b">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <MapIcon className="text-blue-600" />
+              <h1 className="text-xl font-bold text-gray-800">HydroSource</h1>
+            </div>
+            {session?.isDemo && (
+              <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-bold uppercase">Demo</span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex flex-col items-center justify-center gap-1 p-2 bg-blue-50 text-blue-700 rounded-lg cursor-pointer hover:bg-blue-100 transition text-xs font-semibold">
+              <FileUp size={16} /> KML
+              <input type="file" className="hidden" accept=".kml" onChange={handleKMLUpload} />
+            </label>
+            
+            <button 
+              onClick={generarInforme} 
+              className="flex flex-col items-center justify-center gap-1 p-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition text-xs font-semibold"
+            >
+              <Download size={16} /> Informe
+            </button>
+          </div>
         </div>
 
-        <div className="flex flex-col gap-4 mb-6">
-          <label className="flex items-center justify-center gap-2 p-2 bg-blue-50 text-blue-700 rounded-lg cursor-pointer hover:bg-blue-100 transition">
-            <FileUp size={18} /> Subir KML
-            <input type="file" className="hidden" accept=".kml" onChange={handleKMLUpload} />
-          </label>
-          
+        {/* Ficha Técnica (Si hay seleccionado o creando) */}
+        {selectedPunto ? (
+          <div className="flex-1 overflow-y-auto p-4 bg-gray-50">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-sm font-bold text-blue-800 flex items-center gap-2 uppercase">
+                <Database size={16} /> {isEditing ? (puntos.find(p => p.id === selectedPunto.id) ? 'Editando Ficha' : 'Nueva Ficha') : 'Ficha Técnica'}
+              </h2>
+              <button 
+                onClick={() => { 
+                  if (tempLayer) tempLayer.remove();
+                  setSelectedPunto(null); 
+                  setIsEditing(false); 
+                  setTempLayer(null);
+                }} 
+                className="text-xs text-gray-400 hover:text-gray-600"
+              >
+                Cancelar
+              </button>
+            </div>
+            
+            <div className="space-y-4">
+              {isEditing ? (
+                <div className="space-y-3">
+                  <div className="bg-blue-50 p-2 rounded text-[10px] text-blue-700 font-medium mb-2">
+                    Completa los datos del punto dibujado en el mapa.
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Nombre del Punto</label>
+                    <input 
+                      placeholder="Ej: Toma de Agua Sector A"
+                      className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-400 outline-none" 
+                      value={editForm.nombre} 
+                      onChange={e => setEditForm({...editForm, nombre: e.target.value})}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Sector / Ubicación</label>
+                    <input 
+                      placeholder="Ej: Zona Norte"
+                      className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-400 outline-none" 
+                      value={editForm.sector} 
+                      onChange={e => setEditForm({...editForm, sector: e.target.value})}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Quebrada que Alimenta</label>
+                    <input 
+                      placeholder="Nombre de la quebrada"
+                      className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-400 outline-none" 
+                      value={editForm.quebrada} 
+                      onChange={e => setEditForm({...editForm, quebrada: e.target.value})}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Río al que Llega</label>
+                    <input 
+                      placeholder="Nombre del río"
+                      className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-400 outline-none" 
+                      value={editForm.rio} 
+                      onChange={e => setEditForm({...editForm, rio: e.target.value})}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Notas</label>
+                    <textarea 
+                      placeholder="Observaciones adicionales..."
+                      className="w-full p-2 text-sm border rounded h-20 focus:ring-2 focus:ring-blue-400 outline-none" 
+                      value={editForm.notas} 
+                      onChange={e => setEditForm({...editForm, notas: e.target.value})}
+                    />
+                  </div>
+                  <div className="flex gap-2 pt-2">
+                    <button onClick={saveEdit} className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-2 hover:bg-blue-700 transition">
+                      <Save size={14} /> Guardar Registro
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="bg-white p-3 rounded-lg shadow-sm border">
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Nombre del Punto</label>
+                    <p className="text-sm font-semibold text-gray-800">{selectedPunto.nombre}</p>
+                  </div>
+                  
+                  <div className="bg-white p-3 rounded-lg shadow-sm border">
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Sector / Ubicación</label>
+                    <p className="text-sm text-gray-700">{selectedPunto.sector || 'No especificado'}</p>
+                  </div>
+
+                  <div className="bg-white p-3 rounded-lg shadow-sm border-l-4 border-blue-400">
+                    <label className="text-[10px] text-blue-400 uppercase font-bold">Alimenta a (Quebrada)</label>
+                    <p className="text-sm text-gray-700">{selectedPunto.quebrada || 'No especificado'}</p>
+                  </div>
+
+                  <div className="bg-white p-3 rounded-lg shadow-sm border-l-4 border-green-400">
+                    <label className="text-[10px] text-green-400 uppercase font-bold">Llega a (Río)</label>
+                    <p className="text-sm text-gray-700">{selectedPunto.rio || 'No especificado'}</p>
+                  </div>
+
+                  <div className="bg-white p-3 rounded-lg shadow-sm border">
+                    <label className="text-[10px] text-gray-400 uppercase font-bold">Notas Adicionales</label>
+                    <p className="text-xs text-gray-600 italic">{selectedPunto.notas || 'Sin notas'}</p>
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => handleEdit(selectedPunto)}
+                      className="flex-1 py-2 bg-blue-50 text-blue-600 rounded-lg text-xs font-bold hover:bg-blue-100 transition flex items-center justify-center gap-2"
+                    >
+                      Editar Información
+                    </button>
+                    <button 
+                      onClick={async () => {
+                        if (confirm('¿Eliminar este registro?') && supabase) {
+                          if (!session.isDemo) {
+                            await supabase.from('puntos_hidricos').delete().eq('id', selectedPunto.id);
+                            fetchPuntos();
+                          } else {
+                            setPuntos(prev => prev.filter(p => p.id !== selectedPunto.id));
+                          }
+                          setSelectedPunto(null);
+                        }
+                      }}
+                      className="flex-1 py-2 bg-red-50 text-red-600 rounded-lg text-xs font-bold hover:bg-red-100 transition flex items-center justify-center gap-2"
+                    >
+                      <Trash2 size={14} /> Eliminar
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto p-4">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Inventario Hídrico</h2>
+              <button 
+                onClick={() => alert("Para crear un nuevo registro, utiliza las herramientas de dibujo en la esquina superior derecha del mapa (iconos de punto o línea).")}
+                className="text-[10px] bg-blue-600 text-white px-2 py-1 rounded font-bold hover:bg-blue-700 transition flex items-center gap-1"
+              >
+                + Nuevo Registro
+              </button>
+            </div>
+            {loading ? (
+              <div className="text-center py-8 text-gray-400 animate-pulse">Cargando datos...</div>
+            ) : puntos.length === 0 ? (
+              <div className="text-center py-8 text-gray-400 italic text-sm">No hay registros. Dibuja en el mapa para empezar.</div>
+            ) : (
+              <div className="space-y-2">
+                {puntos.map(p => (
+                  <div 
+                    key={p.id} 
+                    onClick={() => setSelectedPunto(p)}
+                    className="p-3 bg-white rounded-lg border border-gray-100 shadow-sm hover:border-blue-300 cursor-pointer transition group"
+                  >
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <p className="text-sm font-bold text-gray-800">{p.nombre}</p>
+                        <p className="text-[10px] text-gray-400 italic">{p.sector || 'Sin sector'}</p>
+                      </div>
+                      <Info size={14} className="text-gray-300 group-hover:text-blue-500" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="p-4 border-t bg-gray-50">
           <button 
-            onClick={generarInforme} 
-            className="flex items-center justify-center gap-2 p-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition"
+            onClick={() => supabase?.auth.signOut()} 
+            className="w-full flex items-center justify-center gap-2 text-gray-500 hover:text-red-600 transition text-sm font-medium"
           >
-            <Download size={18} /> Descargar PDF
+            <LogOut size={16} /> Cerrar Sesión
           </button>
         </div>
-
-        <div className="flex-1 overflow-y-auto pr-2">
-          <h2 className="text-sm font-semibold text-gray-500 uppercase mb-3">Puntos Registrados</h2>
-          {loading ? (
-            <div className="text-center py-4 text-gray-400">Cargando...</div>
-          ) : puntos.length === 0 ? (
-            <div className="text-center py-4 text-gray-400 italic">No hay puntos registrados</div>
-          ) : (
-            puntos.map(p => (
-              <div key={p.id} className="p-3 mb-2 bg-gray-50 rounded-md border hover:border-blue-400 cursor-pointer transition group relative">
-                <p className="font-medium text-gray-800">{p.nombre}</p>
-                <p className="text-xs text-gray-500 italic">{p.tipo_geometria}</p>
-                <button 
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    if (confirm('¿Eliminar este punto?') && supabase) {
-                      await supabase.from('puntos_hidricos').delete().eq('id', p.id);
-                      fetchPuntos();
-                    }
-                  }}
-                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-700 transition"
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-
-        <button 
-          onClick={() => supabase?.auth.signOut()} 
-          className="mt-4 flex items-center gap-2 text-gray-600 hover:text-red-600 transition p-2 rounded hover:bg-red-50"
-        >
-          <LogOut size={18} /> Cerrar Sesión
-        </button>
       </aside>
 
       {/* Mapa Principal */}
@@ -205,166 +431,80 @@ export default function App() {
           className="h-full w-full" 
           ref={mapRef}
         >
-          <TileLayer 
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
-          />
-          
-          <FeatureGroup>
-            <EditControl
-              position="topright"
-              onCreated={async (e: any) => {
-                if (!supabase || !session) return;
-                const { layer } = e;
-                const geojson = layer.toGeoJSON();
-                const nombre = prompt("Nombre del punto/zona:");
-                if (nombre === null) return; // Cancelled
-                const notas = prompt("Notas adicionales:");
+          <LayersControl position="topright">
+            <LayersControl.BaseLayer checked name="Mapa Estándar">
+              <TileLayer 
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
+              />
+            </LayersControl.BaseLayer>
+            
+            <LayersControl.BaseLayer name="Satélite (Híbrido)">
+              <TileLayer
+                attribution='Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+                url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+              />
+            </LayersControl.BaseLayer>
 
-                await supabase.from('puntos_hidricos').insert([{
-                  user_id: session.user.id,
-                  nombre: nombre || "Nuevo Punto",
-                  notas: notas,
-                  tipo_geometria: geojson.geometry.type,
-                  geojson: geojson
-                }]);
-                fetchPuntos();
-              }}
-              draw={{
-                rectangle: false,
-                circle: false,
-                circlemarker: false,
-              }}
-            />
-            {puntos.map(p => (
-              <GeoJSON key={p.id} data={p.geojson} />
-            ))}
-          </FeatureGroup>
+            <LayersControl.Overlay checked name="Puntos Hídricos">
+              <FeatureGroup>
+                <EditControl
+                  position="topright"
+                  onCreated={(e: any) => {
+                    if (!session) return;
+                    const { layer } = e;
+                    const geojson = layer.toGeoJSON();
+                    
+                    const newPoint = {
+                      id: crypto.randomUUID(),
+                      user_id: session.user.id,
+                      nombre: "Nuevo Punto",
+                      sector: "",
+                      quebrada: "",
+                      rio: "",
+                      notas: "",
+                      tipo_geometria: geojson.geometry.type,
+                      geojson: geojson,
+                      created_at: new Date().toISOString()
+                    };
+
+                    setTempLayer(layer);
+                    setSelectedPunto(newPoint);
+                    setEditForm(newPoint);
+                    setIsEditing(true);
+                  }}
+                  draw={{
+                    rectangle: false,
+                    circle: false,
+                    circlemarker: false,
+                  }}
+                />
+                {puntos.map(p => (
+                  <GeoJSON 
+                    key={p.id} 
+                    data={p.geojson} 
+                    eventHandlers={{
+                      click: () => setSelectedPunto(p)
+                    }}
+                  >
+                    <Popup>
+                      <div className="p-1">
+                        <h3 className="font-bold text-blue-700 m-0">{p.nombre}</h3>
+                        <p className="text-[10px] text-gray-500 m-0 mb-2">{p.sector}</p>
+                        <div className="text-[11px] space-y-1">
+                          <p><strong>Quebrada:</strong> {p.quebrada}</p>
+                          <p><strong>Río:</strong> {p.rio}</p>
+                        </div>
+                      </div>
+                    </Popup>
+                  </GeoJSON>
+                ))}
+              </FeatureGroup>
+            </LayersControl.Overlay>
+          </LayersControl>
         </MapContainer>
       </main>
     </div>
   );
 }
 
-// Componente de Login Simple
-function Login({ setSession, handleAnonymousLogin }: { setSession: (s: any) => void, handleAnonymousLogin: () => void }) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [isSignUp, setIsSignUp] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!supabase) return;
-    setLoading(true);
-    setErrorMsg(null);
-    try {
-      if (isSignUp) {
-        const { data, error } = await supabase.auth.signUp({ email, password });
-        if (error) throw error;
-        
-        if (data.session) {
-          setSession(data.session);
-        } else {
-          setErrorMsg('¡Registro exitoso! Por favor, confirma tu correo o desactiva "Confirm Email" en Supabase.');
-        }
-      } else {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-        setSession(data.session);
-      }
-    } catch (error: any) {
-      setErrorMsg(error.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const onGuestLogin = async () => {
-    setErrorMsg(null);
-    try {
-      await handleAnonymousLogin();
-    } catch (error: any) {
-      setErrorMsg(error.message);
-    }
-  };
-
-  return (
-    <div className="h-screen flex items-center justify-center bg-blue-600 p-4">
-      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md">
-        <div className="flex justify-center mb-6">
-          <div className="bg-blue-100 p-3 rounded-full">
-            <MapIcon className="text-blue-600 w-8 h-8" />
-          </div>
-        </div>
-        <h2 className="text-2xl font-bold mb-2 text-center text-gray-800">
-          HydroSource
-        </h2>
-        <p className="text-center text-gray-500 mb-6 text-sm">Plataforma de Monitoreo Hídrico</p>
-        
-        {errorMsg && (
-          <div className="mb-6 p-4 bg-red-50 border-l-4 border-red-500 text-red-700 text-sm rounded">
-            <p className="font-bold">⚠️ Error de Configuración:</p>
-            <p>{errorMsg}</p>
-            <div className="mt-2 text-xs opacity-80">
-              <p>1. Ve a Supabase &rarr; Authentication &rarr; Providers</p>
-              <p>2. Activa "Anonymous" y desactiva "Confirm Email"</p>
-            </div>
-          </div>
-        )}
-
-        <button 
-          onClick={onGuestLogin}
-          disabled={loading}
-          className="w-full bg-green-600 text-white p-4 rounded-xl font-bold mb-6 hover:bg-green-700 transition shadow-lg flex items-center justify-center gap-2 disabled:opacity-50"
-        >
-          {loading ? 'Entrando...' : '🚀 Entrar como Invitado (Sin Registro)'}
-        </button>
-
-        <div className="relative mb-6">
-          <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-gray-200"></span></div>
-          <div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-2 text-gray-400">O usa tu cuenta</span></div>
-        </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <input 
-              type="email" 
-              required
-              placeholder="Email" 
-              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition" 
-              onChange={e => setEmail(e.target.value)} 
-            />
-          </div>
-          <div>
-            <input 
-              type="password" 
-              required
-              placeholder="Contraseña" 
-              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition" 
-              onChange={e => setPassword(e.target.value)} 
-            />
-          </div>
-          <button 
-            disabled={loading}
-            className="w-full bg-blue-600 text-white p-3 rounded-lg font-bold hover:bg-blue-700 transition disabled:opacity-50"
-          >
-            {isSignUp ? 'Crear Cuenta' : 'Iniciar Sesión'}
-          </button>
-        </form>
-
-        <p className="text-center mt-6 text-sm text-gray-600">
-          {isSignUp ? '¿Ya tienes cuenta?' : '¿Quieres una cuenta propia?'}
-          <button 
-            type="button"
-            onClick={() => setIsSignUp(!isSignUp)}
-            className="ml-1 text-blue-600 font-semibold hover:underline"
-          >
-            {isSignUp ? 'Inicia sesión' : 'Regístrate'}
-          </button>
-        </p>
-      </div>
-    </div>
-  );
-}
