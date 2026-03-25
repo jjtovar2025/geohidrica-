@@ -44,7 +44,7 @@ export default function App() {
 
   useEffect(() => {
     if (!supabase) {
-      setSession({ user: { id: 'demo-user' } });
+      setSession({ user: { id: 'demo-user' }, isDemo: true });
       return;
     }
 
@@ -167,12 +167,16 @@ export default function App() {
   };
 
   const saveEdit = async () => {
-    if (!supabase || !selectedPunto) return;
+    if (!selectedPunto || !session) {
+      console.warn('Cannot save: selectedPunto or session is missing', { selectedPunto, session });
+      return;
+    }
     setLoading(true);
     try {
       const isNew = !puntos.find(p => p.id === selectedPunto.id);
+      console.log('Saving point:', { isNew, editForm });
       
-      if (!session.isDemo) {
+      if (supabase && !session.isDemo) {
         if (isNew) {
           const { error } = await supabase.from('puntos_hidricos').insert([editForm]);
           if (error) throw error;
@@ -189,7 +193,7 @@ export default function App() {
             .eq('id', selectedPunto.id);
           if (error) throw error;
         }
-        fetchPuntos();
+        await fetchPuntos();
       } else {
         if (isNew) {
           setPuntos(prev => [...prev, editForm]);
@@ -206,9 +210,9 @@ export default function App() {
       setSelectedPunto({ ...selectedPunto, ...editForm });
       setIsEditing(false);
       alert("¡Registro guardado con éxito!");
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving point:', error);
-      alert("Error al guardar el registro");
+      alert(`Error al guardar: ${error.message || 'Error desconocido'}`);
     } finally {
       setLoading(false);
     }
@@ -455,8 +459,16 @@ export default function App() {
                     const { layer } = e;
                     const geojson = layer.toGeoJSON();
                     
+                    const generateId = () => {
+                      try {
+                        return crypto.randomUUID();
+                      } catch (e) {
+                        return Math.random().toString(36).substring(2) + Date.now().toString(36);
+                      }
+                    };
+
                     const newPoint = {
-                      id: crypto.randomUUID(),
+                      id: generateId(),
                       user_id: session.user.id,
                       nombre: "Nuevo Punto",
                       sector: "",
