@@ -16,10 +16,12 @@ import 'leaflet/dist/leaflet.css';
 import 'leaflet-draw/dist/leaflet.draw.css';
 
 // Configuración Supabase
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const supabase = (supabaseUrl && supabaseAnonKey) 
+  ? createClient(supabaseUrl, supabaseAnonKey) 
+  : null;
 
 export default function App() {
   const [session, setSession] = useState<any>(null);
@@ -28,6 +30,8 @@ export default function App() {
   const mapRef = useRef<any>();
 
   useEffect(() => {
+    if (!supabase) return;
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       if (session) fetchPuntos();
@@ -42,6 +46,7 @@ export default function App() {
   }, []);
 
   async function fetchPuntos() {
+    if (!supabase) return;
     setLoading(true);
     try {
       const { data, error } = await supabase.from('puntos_hidricos').select('*');
@@ -57,11 +62,11 @@ export default function App() {
   // Manejador de subida de archivos KML
   const handleKMLUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !session) return;
+    if (!file || !session || !supabase) return;
 
     const reader = new FileReader();
     reader.onload = async (event) => {
-      if (!event.target?.result) return;
+      if (!event.target?.result || !supabase) return;
       const xml = new DOMParser().parseFromString(event.target.result as string, "text/xml");
       const geojson = kml(xml);
       
@@ -71,7 +76,6 @@ export default function App() {
           nombre: (feature.properties as any)?.name || "Punto KML",
           tipo_geometria: feature.geometry.type,
           geojson: feature,
-          // geom: `SRID=4326;${JSON.stringify(feature.geometry)}` // PostGIS format
         }]);
       }
       fetchPuntos();
@@ -100,6 +104,25 @@ export default function App() {
     doc.save("informe-hidrico.pdf");
   };
 
+  const handleAnonymousLogin = async () => {
+    if (!supabase) return;
+    setLoading(true);
+    try {
+      const { data, error } = await supabase.auth.signInAnonymously();
+      if (error) {
+        if (error.message.includes("disabled")) {
+          throw new Error("El acceso de invitado está desactivado. Activa 'Anonymous' en Authentication -> Providers en tu panel de Supabase.");
+        }
+        throw error;
+      }
+      setSession(data.session);
+    } catch (error: any) {
+      alert("⚠️ Configuración requerida: " + error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (!supabaseUrl || !supabaseAnonKey) {
     return (
       <div className="h-screen flex items-center justify-center bg-gray-100 p-4">
@@ -113,7 +136,7 @@ export default function App() {
     );
   }
 
-  if (!session) return <Login setSession={setSession} />;
+  if (!session) return <Login setSession={setSession} handleAnonymousLogin={handleAnonymousLogin} />;
 
   return (
     <div className="flex h-screen bg-gray-100 font-sans overflow-hidden">
@@ -152,7 +175,7 @@ export default function App() {
                 <button 
                   onClick={async (e) => {
                     e.stopPropagation();
-                    if (confirm('¿Eliminar este punto?')) {
+                    if (confirm('¿Eliminar este punto?') && supabase) {
                       await supabase.from('puntos_hidricos').delete().eq('id', p.id);
                       fetchPuntos();
                     }
@@ -167,7 +190,7 @@ export default function App() {
         </div>
 
         <button 
-          onClick={() => supabase.auth.signOut()} 
+          onClick={() => supabase?.auth.signOut()} 
           className="mt-4 flex items-center gap-2 text-gray-600 hover:text-red-600 transition p-2 rounded hover:bg-red-50"
         >
           <LogOut size={18} /> Cerrar Sesión
@@ -191,6 +214,7 @@ export default function App() {
             <EditControl
               position="topright"
               onCreated={async (e: any) => {
+                if (!supabase || !session) return;
                 const { layer } = e;
                 const geojson = layer.toGeoJSON();
                 const nombre = prompt("Nombre del punto/zona:");
@@ -223,73 +247,115 @@ export default function App() {
 }
 
 // Componente de Login Simple
-function Login({ setSession }: { setSession: (s: any) => void }) {
+function Login({ setSession, handleAnonymousLogin }: { setSession: (s: any) => void, handleAnonymousLogin: () => void }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!supabase) return;
     setLoading(true);
+    setErrorMsg(null);
     try {
       if (isSignUp) {
         const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
-        alert('Registro exitoso. Revisa tu email para confirmar.');
+        
+        if (data.session) {
+          setSession(data.session);
+        } else {
+          setErrorMsg('¡Registro exitoso! Por favor, confirma tu correo o desactiva "Confirm Email" en Supabase.');
+        }
       } else {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
         setSession(data.session);
       }
     } catch (error: any) {
-      alert(error.message);
+      setErrorMsg(error.message);
     } finally {
       setLoading(false);
     }
   };
 
+  const onGuestLogin = async () => {
+    setErrorMsg(null);
+    try {
+      await handleAnonymousLogin();
+    } catch (error: any) {
+      setErrorMsg(error.message);
+    }
+  };
+
   return (
     <div className="h-screen flex items-center justify-center bg-blue-600 p-4">
-      <form onSubmit={handleSubmit} className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md">
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md">
         <div className="flex justify-center mb-6">
           <div className="bg-blue-100 p-3 rounded-full">
             <MapIcon className="text-blue-600 w-8 h-8" />
           </div>
         </div>
-        <h2 className="text-2xl font-bold mb-6 text-center text-gray-800">
-          {isSignUp ? 'Crear Cuenta HydroSource' : 'Acceso HydroSource'}
+        <h2 className="text-2xl font-bold mb-2 text-center text-gray-800">
+          HydroSource
         </h2>
-        <div className="space-y-4">
+        <p className="text-center text-gray-500 mb-6 text-sm">Plataforma de Monitoreo Hídrico</p>
+        
+        {errorMsg && (
+          <div className="mb-6 p-4 bg-red-50 border-l-4 border-red-500 text-red-700 text-sm rounded">
+            <p className="font-bold">⚠️ Error de Configuración:</p>
+            <p>{errorMsg}</p>
+            <div className="mt-2 text-xs opacity-80">
+              <p>1. Ve a Supabase &rarr; Authentication &rarr; Providers</p>
+              <p>2. Activa "Anonymous" y desactiva "Confirm Email"</p>
+            </div>
+          </div>
+        )}
+
+        <button 
+          onClick={onGuestLogin}
+          disabled={loading}
+          className="w-full bg-green-600 text-white p-4 rounded-xl font-bold mb-6 hover:bg-green-700 transition shadow-lg flex items-center justify-center gap-2 disabled:opacity-50"
+        >
+          {loading ? 'Entrando...' : '🚀 Entrar como Invitado (Sin Registro)'}
+        </button>
+
+        <div className="relative mb-6">
+          <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-gray-200"></span></div>
+          <div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-2 text-gray-400">O usa tu cuenta</span></div>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
             <input 
               type="email" 
               required
-              placeholder="tu@email.com" 
+              placeholder="Email" 
               className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition" 
               onChange={e => setEmail(e.target.value)} 
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Contraseña</label>
             <input 
               type="password" 
               required
-              placeholder="••••••••" 
+              placeholder="Contraseña" 
               className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition" 
               onChange={e => setPassword(e.target.value)} 
             />
           </div>
-        </div>
-        <button 
-          disabled={loading}
-          className="w-full bg-blue-600 text-white p-3 rounded-lg font-bold mt-8 hover:bg-blue-700 transition disabled:opacity-50"
-        >
-          {loading ? 'Procesando...' : (isSignUp ? 'Registrarse' : 'Entrar')}
-        </button>
+          <button 
+            disabled={loading}
+            className="w-full bg-blue-600 text-white p-3 rounded-lg font-bold hover:bg-blue-700 transition disabled:opacity-50"
+          >
+            {isSignUp ? 'Crear Cuenta' : 'Iniciar Sesión'}
+          </button>
+        </form>
+
         <p className="text-center mt-6 text-sm text-gray-600">
-          {isSignUp ? '¿Ya tienes cuenta?' : '¿No tienes cuenta?'}
+          {isSignUp ? '¿Ya tienes cuenta?' : '¿Quieres una cuenta propia?'}
           <button 
             type="button"
             onClick={() => setIsSignUp(!isSignUp)}
@@ -298,7 +364,7 @@ function Login({ setSession }: { setSession: (s: any) => void }) {
             {isSignUp ? 'Inicia sesión' : 'Regístrate'}
           </button>
         </p>
-      </form>
+      </div>
     </div>
   );
 }
